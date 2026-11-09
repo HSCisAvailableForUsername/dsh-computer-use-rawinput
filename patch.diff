@@ -1,0 +1,144 @@
+diff --git a/lib/native-worker.js b/lib/native-worker.js
+index 9f9a596..a003ec8 100644
+--- a/lib/native-worker.js
++++ b/lib/native-worker.js
+@@ -137,6 +137,7 @@ function int(args, key, fallback) {
+ 	return typeof value === "number" ? Math.trunc(value) : fallback;
+ }
+ function displays() {
++	VS_CACHE = null;
+ 	const list = [];
+ 	const callback = koffi.register((monitor) => {
+ 		const info = { cbSize: MONITORINFOEXW.size };
+@@ -203,6 +204,17 @@ function mouse(flags, data = 0) {
+ 	b.writeBigUInt64LE(MARKER, 32);
+ 	return b;
+ }
++/** Absolute mouse move over the virtual desktop (normalised 0..65535). */
++function mouseAbs(nx, ny) {
++	const b = Buffer.alloc(INPUT_SIZE);
++	b.writeUInt32LE(0, 0);
++	b.writeInt32LE(nx, 8);
++	b.writeInt32LE(ny, 12);
++	b.writeUInt32LE(0xc001, 20);
++	b.writeBigUInt64LE(MARKER, 32);
++	return b;
++}
++let VS_CACHE = null;
+ function key(vk, up) {
+ 	const b = Buffer.alloc(INPUT_SIZE);
+ 	b.writeUInt32LE(1, 0);
+@@ -218,7 +230,30 @@ function send(inputs) {
+ }
+ function move(x, y) {
+ 	SetCursorPos(x, y);
+-	send([mouse(1)]);
++	// Absolute move through SendInput as well: games and other Raw Input
++	// consumers ignore the bare cursor teleport from SetCursorPos, but they
++	// do honour MOUSEEVENTF_ABSOLUTE (normalised over the virtual desktop).
++	const vs = virtualScreen();
++	if (vs && vs.width > 1 && vs.height > 1) {
++		send([mouseAbs(Math.round((x - vs.x) * 65535 / (vs.width - 1)), Math.round((y - vs.y) * 65535 / (vs.height - 1)))]);
++	} else {
++		send([mouse(1)]);
++	}
++}
++/** Union of the physical monitor rectangles, in virtual-screen pixels. */
++function virtualScreen() {
++	if (VS_CACHE) return VS_CACHE;
++	const list = displays();
++	if (list.length === 0) return null;
++	let x = Infinity, y = Infinity, r = -Infinity, b = -Infinity;
++	for (const d of list) {
++		x = Math.min(x, d.x);
++		y = Math.min(y, d.y);
++		r = Math.max(r, d.x + d.width);
++		b = Math.max(b, d.y + d.height);
++	}
++	VS_CACHE = { x, y, width: r - x, height: b - y };
++	return VS_CACHE;
+ }
+ function buttonFlags(button) {
+ 	if (button === "right") return [8, 16];
+diff --git a/helper/CuHelper.cs b/helper/CuHelper.cs
+index 69cb1f0..5a45f04 100644
+--- a/helper/CuHelper.cs
++++ b/helper/CuHelper.cs
+@@ -128,7 +128,8 @@ namespace DshComputerUse
+         public const uint INPUT_MOUSE = 0, INPUT_KEYBOARD = 1;
+         public const uint KEYEVENTF_EXTENDEDKEY = 0x1, KEYEVENTF_KEYUP = 0x2, KEYEVENTF_UNICODE = 0x4;
+         public const uint MOUSEEVENTF_MOVE = 0x1, MOUSEEVENTF_LEFTDOWN = 0x2, MOUSEEVENTF_LEFTUP = 0x4, MOUSEEVENTF_RIGHTDOWN = 0x8, MOUSEEVENTF_RIGHTUP = 0x10,
+-            MOUSEEVENTF_MIDDLEDOWN = 0x20, MOUSEEVENTF_MIDDLEUP = 0x40, MOUSEEVENTF_WHEEL = 0x800, MOUSEEVENTF_HWHEEL = 0x1000;
++            MOUSEEVENTF_MIDDLEDOWN = 0x20, MOUSEEVENTF_MIDDLEUP = 0x40, MOUSEEVENTF_WHEEL = 0x800, MOUSEEVENTF_HWHEEL = 0x1000,
++            MOUSEEVENTF_ABSOLUTE = 0x8000, MOUSEEVENTF_VIRTUALDESK = 0x4000;
+         public static readonly IntPtr Marker = new IntPtr(0x44534843); // "DSHC"
+     }
+ 
+@@ -323,6 +324,35 @@ namespace DshComputerUse
+ 
+     internal static class Screen2
+     {
++        public struct VirtualScreen
++        {
++            public int Left, Top, Width, Height;
++        }
++
++        /** Union of every monitor's physical rectangle (the virtual desktop). */
++        public static VirtualScreen VirtualRect()
++        {
++            var vs = new VirtualScreen { Left = int.MaxValue, Top = int.MaxValue, Width = 0, Height = 0 };
++            int right = int.MinValue, bottom = int.MinValue;
++            Native.MonitorEnumProc cb = delegate (IntPtr h, IntPtr hdc, ref Native.RECT rc, IntPtr data)
++            {
++                var info = new Native.MONITORINFOEX();
++                info.cbSize = Marshal.SizeOf(typeof(Native.MONITORINFOEX));
++                Native.GetMonitorInfo(h, ref info);
++                if (info.rcMonitor.Left < vs.Left) vs.Left = info.rcMonitor.Left;
++                if (info.rcMonitor.Top < vs.Top) vs.Top = info.rcMonitor.Top;
++                if (info.rcMonitor.Right > right) right = info.rcMonitor.Right;
++                if (info.rcMonitor.Bottom > bottom) bottom = info.rcMonitor.Bottom;
++                return true;
++            };
++            Native.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
++            GC.KeepAlive(cb);
++            if (right <= vs.Left || bottom <= vs.Top) return new VirtualScreen { Left = 0, Top = 0, Width = 0, Height = 0 };
++            vs.Width = right - vs.Left;
++            vs.Height = bottom - vs.Top;
++            return vs;
++        }
++
+         public static List<object> Displays()
+         {
+             var list = new List<object>();
+@@ -589,11 +619,31 @@ namespace DshComputerUse
+ 
+         public static void Move(int x, int y)
+         {
++            // Raw Input consumers (games, DirectInput titles) ignore the plain
++            // cursor teleport and only follow injected absolute movement, so
++            // send that first, normalised over the physical virtual desktop.
++            var vs = Screen2.VirtualRect();
++            if (vs.Width > 1 && vs.Height > 1)
++            {
++                int nx = (int)Math.Round((x - vs.Left) * 65535.0 / (vs.Width - 1));
++                int ny = (int)Math.Round((y - vs.Top) * 65535.0 / (vs.Height - 1));
++                Send(new List<Native.INPUT> { MouseAbs(nx, ny) });
++            }
+             Native.SetCursorPos(x, y);
+             // A zero relative move lets apps that only watch WM_MOUSEMOVE notice the cursor.
+             Send(new List<Native.INPUT> { Mouse(Native.MOUSEEVENTF_MOVE, 0) });
+         }
+ 
++        /** Absolute mouse move normalised over the virtual desktop (0..65535). */
++        static Native.INPUT MouseAbs(int nx, int ny)
++        {
++            var i = new Native.INPUT(); i.type = Native.INPUT_MOUSE;
++            i.u.mi.dx = nx; i.u.mi.dy = ny;
++            i.u.mi.dwFlags = Native.MOUSEEVENTF_MOVE | Native.MOUSEEVENTF_ABSOLUTE | Native.MOUSEEVENTF_VIRTUALDESK;
++            i.u.mi.dwExtraInfo = Native.Marker;
++            return i;
++        }
++
+         static void Flags(string button, out uint down, out uint up)
+         {
+             switch (button)
